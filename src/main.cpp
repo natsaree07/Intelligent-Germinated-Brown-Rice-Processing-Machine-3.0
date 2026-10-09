@@ -1,10 +1,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_arduino_version.h>
 #include <PubSubClient.h>
 #include <Wire.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <ArtronShop_SHT45.h>
 #include <LiquidCrystal_I2C.h>
 #include "secrets.h"
 
@@ -86,8 +88,6 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 #define ONE_WIRE_BUS 15
 #define LCD_I2C_SDA_PIN 21
 #define LCD_I2C_SCL_PIN 22
-#define SHT45_I2C_SDA_PIN 23
-#define SHT45_I2C_SCL_PIN 5
 
 // ต้องกดปุ่มค้างตามเวลานี้จึงยอมรับคำสั่ง Start
 // ช่วยป้องกันสัญญาณรบกวนและการกดเด้ง
@@ -102,20 +102,6 @@ const unsigned long STOP_BUTTON_HOLD_TIME = 1500UL;
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
-
-ArtronShop_SHT45 sht45(&Wire1, 0x44);
-
-bool sht45Available = false;
-
-// SHT45 recovery: no automatic restart after a persistent sensor fault.
-const unsigned long SHT45_RECOVERY_INTERVAL_MS = 3000UL;
-const unsigned long SHT45_FAULT_STOP_MS = 10000UL;
-bool ambientFaultActive = false;
-unsigned long ambientFaultSince = 0;
-unsigned long lastShtRecoveryMillis = 0;
-bool shtRecoveryAttempted = false;
-bool ambientBufferResetNeeded = false;
-const char* sht45ReadError = "not measured";
 
 // ============================================================
 // WIFI / MQTT
@@ -333,6 +319,98 @@ unsigned long lastAirSensorOK = 0;
 
 const unsigned long SENSOR_TIMEOUT = 5000;
 
+// SHT45 now lives on a separate ESP32; data arrives by ESP-NOW.
+// ESP-NOW runs on the SAME 2.4 GHz channel as the main board's Wi-Fi router.
+const unsigned long SHT45_FAULT_STOP_MS = 10000UL;
+const unsigned long ESP_NOW_STALE_MS = 5000UL;
+const uint32_t SENSOR_MAGIC = 0x53485445UL;
+struct SensorPacket {
+  uint32_t magic;
+  uint32_t bootId;
+  uint32_t sequence;
+  float temperature;
+  float humidity;
+};
+portMUX_TYPE sensorMux = portMUX_INITIALIZER_UNLOCKED;
+SensorPacket pendingSensor = {};
+volatile bool sensorPending = false;
+bool sensorSeen = false;
+uint32_t lastSensorBoot = 0, lastSensorSeq = 0;
+unsigned long lastSensorPacketMs = 0;
+bool ambientFaultActive = false;
+unsigned long ambientFaultSince = 0;
+bool ambientBufferResetNeeded = false;
+void onSensorPacket(const uint8_t *data, int length) {
+  if (length != sizeof(SensorPacket)) return;
+  SensorPacket temp;
+  memcpy(&temp, data, sizeof(temp));
+  if (temp.magic != SENSOR_MAGIC || !isfinite(temp.temperature) ||
+      !isfinite(temp.humidity) || temp.temperature <= -20.0f ||
+      temp.temperature >= 90.0f || temp.humidity < 0.0f ||
+      temp.humidity > 100.0f) return;
+  portENTER_CRITICAL(&sensorMux);
+  pendingSensor = temp;
+  sensorPending = true;
+  portEXIT_CRITICAL(&sensorMux);
+}
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void sensorReceiveCallback(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  onSensorPacket(data, len);
+}
+#else
+void sensorReceiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
+  onSensorPacket(data, len);
+}
+#endif
+void serviceSensorESPNow() {
+  SensorPacket p;
+  bool pending = false;
+  portENTER_CRITICAL(&sensorMux);
+  if (sensorPending) {
+    p = pendingSensor;
+    sensorPending = false;
+    pending = true;
+  }
+  portEXIT_CRITICAL(&sensorMux);
+  if (pending) {
+    if (!sensorSeen || p.bootId != lastSensorBoot ||
+        (int32_t)(p.sequence - lastSensorSeq) > 0) {
+      lastSensorBoot = p.bootId;
+      lastSensorSeq = p.sequence;
+      sensorSeen = true;
+      lastSensorPacketMs = millis();
+      if (ambientFaultActive) ambientBufferResetNeeded = true;
+      ambientFaultActive = false;
+      latestAirTemp = p.temperature;
+      latestHumidity = p.humidity;
+      lastAirSensorOK = lastSensorPacketMs;
+    }
+  }
+  // Fail closed even during waits: stop critical outputs once the sample expires.
+  if (processActive && !processPaused && (currentStage == 2 || currentStage == 3) &&
+      (!sensorSeen || millis() - lastSensorPacketMs > ESP_NOW_STALE_MS)) {
+    digitalWrite(HEATER, LOW);
+    digitalWrite(MISTMAKER, LOW);
+    if (!ambientFaultActive) {
+      ambientFaultActive = true;
+      ambientFaultSince = millis();
+    }
+    if (millis() - ambientFaultSince >= SHT45_FAULT_STOP_MS) {
+      processStopRequested = true;
+    }
+  }
+}
+void setupESPNowReceiver() {
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW INIT ERROR: SHT45 unavailable");
+    return;
+  }
+  esp_now_register_recv_cb(sensorReceiveCallback);
+  Serial.print("ESP-NOW receiver MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.printf("ESP-NOW channel: %d\n", WiFi.channel());
+}
+
 bool waterSensorTimeout() {
   if (lastWaterSensorOK == 0) {
     return true;
@@ -393,103 +471,21 @@ float readWaterTemp() {
   return NAN;
 }
 
-void recoverI2CBusIfStuck();
-
-// CRC-8 per Sensirion SHT4x: init 0xFF, polynomial 0x31.
-uint8_t sht45CRC(const uint8_t* bytes, size_t length) {
-  uint8_t crc = 0xFF;
-  for (size_t i = 0; i < length; ++i) {
-    crc ^= bytes[i];
-    for (uint8_t bit = 0; bit < 8; ++bit)
-      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
-  }
-  return crc;
-}
-
-// Read directly because the installed ArtronShop library does not check CRC.
-bool measureAmbientChecked(float& temp, float& humid) {
-  Wire1.beginTransmission(0x44);
-  Wire1.write(0xFD);  // high precision, internal sensor heater OFF
-  uint8_t status = Wire1.endTransmission();
-  if (status != 0) {
-    sht45ReadError = "I2C command/NACK";
-    Serial.printf("[SHT45] I2C status=%u\n", status);
-    return false;
-  }
-  delay(10);
-  if (Wire1.requestFrom((uint8_t)0x44, (uint8_t)6) != 6) {
-    sht45ReadError = "I2C short read";
-    while (Wire1.available()) Wire1.read();
-    return false;
-  }
-  uint8_t data[6];
-  for (uint8_t i = 0; i < 6; ++i) data[i] = (uint8_t)Wire1.read();
-  if (sht45CRC(data, 2) != data[2] || sht45CRC(data + 3, 2) != data[5]) {
-    sht45ReadError = "CRC mismatch";
-    return false;
-  }
-  uint16_t rawT = ((uint16_t)data[0] << 8) | data[1];
-  uint16_t rawH = ((uint16_t)data[3] << 8) | data[4];
-  temp = -45.0f + 175.0f * rawT / 65535.0f;
-  humid = constrain(-6.0f + 125.0f * rawH / 65535.0f, 0.0f, 100.0f);
-  if (!isfinite(temp) || !isfinite(humid) || temp <= -20.0f || temp >= 90.0f) {
-    sht45ReadError = "value outside application range";
-    return false;
-  }
-  return true;
-}
-
 bool readAmbient(float& temp, float& humid) {
-  temp = NAN;
-  humid = NAN;
-
-  if (!sht45Available &&
-      (!shtRecoveryAttempted || millis() - lastShtRecoveryMillis >= SHT45_RECOVERY_INTERVAL_MS)) {
-    shtRecoveryAttempted = true;
-    lastShtRecoveryMillis = millis();
-    recoverI2CBusIfStuck();
-    // Reset only SHT45, never the LCD bus.
-    Wire1.beginTransmission(0x44);
-    Wire1.write(0x94);
-    uint8_t resetStatus = Wire1.endTransmission();
-    delay(2);
-    sht45Available = resetStatus == 0 && sht45.begin();
-    Serial.printf("[SHT45] recovery ACK=%s\n", sht45Available ? "yes" : "no");
+  serviceSensorESPNow();
+  bool valid = sensorSeen && (millis() - lastSensorPacketMs <= ESP_NOW_STALE_MS);
+  if (valid) {
+    temp = latestAirTemp;
+    humid = latestHumidity;
+    return true;
   }
-
-  if (sht45Available) {
-    for (int attempt = 0; attempt < 2; ++attempt) {
-      if (measureAmbientChecked(temp, humid)) {
-        if (ambientFaultActive) {
-          Serial.println("[SHT45] valid readings recovered");
-          ambientBufferResetNeeded = true;
-        }
-        ambientFaultActive = false;
-        latestAirTemp = temp;
-        latestHumidity = humid;
-        lastAirSensorOK = millis();
-        return true;
-      }
-      // Cut critical outputs before retrying or attempting network operations.
-      if (processActive && (currentStage == 2 || currentStage == 3)) {
-        digitalWrite(HEATER, LOW);
-        digitalWrite(MISTMAKER, LOW);
-      }
-      delay(15);
-    }
-  } else {
-    sht45ReadError = "sensor not responding";
-  }
-
-  sht45Available = false;  // allow periodic begin/reset, including boot failure
-  temp = humid = latestAirTemp = latestHumidity = NAN;
+  temp = humid = NAN;
+  latestAirTemp = latestHumidity = NAN;
   ambientBufferResetNeeded = true;
   if (!ambientFaultActive) {
     ambientFaultActive = true;
     ambientFaultSince = millis();
   }
-  Serial.printf("[SHT45] %s; SDA=%d SCL=%d\n", sht45ReadError, digitalRead(SHT45_I2C_SDA_PIN),
-                digitalRead(SHT45_I2C_SCL_PIN));
   return false;
 }
 
@@ -682,39 +678,6 @@ void recoverLCDIfNeeded() {
   lcd.print(lastLCDLine2);
 
   Serial.println("LCD watchdog refresh");
-}
-
-void recoverI2CBusIfStuck() {
-  Wire1.end();
-  // Release HIGH; never drive HIGH against a slave holding the line LOW.
-  pinMode(SHT45_I2C_SDA_PIN, INPUT_PULLUP);
-  pinMode(SHT45_I2C_SCL_PIN, INPUT_PULLUP);
-  delayMicroseconds(10);
-  if (digitalRead(SHT45_I2C_SCL_PIN) == HIGH) {
-    for (uint8_t i = 0; i < 9 && digitalRead(SHT45_I2C_SDA_PIN) == LOW; ++i) {
-      digitalWrite(SHT45_I2C_SCL_PIN, LOW);
-      pinMode(SHT45_I2C_SCL_PIN, OUTPUT_OPEN_DRAIN);
-      delayMicroseconds(10);
-      pinMode(SHT45_I2C_SCL_PIN, INPUT_PULLUP);
-      delayMicroseconds(10);
-      if (digitalRead(SHT45_I2C_SCL_PIN) == LOW) break;
-    }
-    if (digitalRead(SHT45_I2C_SCL_PIN) == HIGH) {
-      // Generate STOP: SDA LOW -> released HIGH while SCL is HIGH.
-      digitalWrite(SHT45_I2C_SCL_PIN, LOW);
-      pinMode(SHT45_I2C_SCL_PIN, OUTPUT_OPEN_DRAIN);
-      digitalWrite(SHT45_I2C_SDA_PIN, LOW);
-      pinMode(SHT45_I2C_SDA_PIN, OUTPUT_OPEN_DRAIN);
-      delayMicroseconds(10);
-      pinMode(SHT45_I2C_SCL_PIN, INPUT_PULLUP);
-      delayMicroseconds(10);
-      pinMode(SHT45_I2C_SDA_PIN, INPUT_PULLUP);
-      delayMicroseconds(10);
-    }
-  }
-  Wire1.begin(SHT45_I2C_SDA_PIN, SHT45_I2C_SCL_PIN);
-  Wire1.setClock(100000);
-  Wire1.setTimeOut(50);
 }
 
 // ============================================================
@@ -1417,6 +1380,7 @@ void connectMQTT() {
 // ============================================================
 
 void ensureConnected() {
+  serviceSensorESPNow();
   unsigned long now = millis();
 
   // ==========================================================
@@ -1525,6 +1489,7 @@ void mqttDelay(unsigned long duration) {
     compensatePause(start, pauseBaseline);
 
     ensureConnected();
+    serviceSensorESPNow();
 
     // PATCH: ปิด Blower เมื่อ cool-down ครบเวลา (non-blocking)
     updateBlowerCooldown();
@@ -1768,7 +1733,7 @@ void updateProcessLCD() {
       if (isnan(displayTemp)) displayTemp = latestAirTemp;
       if (isnan(displayHumid)) displayHumid = latestHumidity;
 
-      String line1 = "TEMP ";
+      String line1 = "T ";
 
       if (isnan(displayTemp)) {
         line1 += "--.-";
@@ -1777,7 +1742,7 @@ void updateProcessLCD() {
         line1 += String(displayTemp, 1);
       }
 
-      line1 += "/" + String(STAGE2_TEMP_TARGET, 0) + "C";
+      line1 += "C FAN ON";
 
       String line2 = "HUM  ";
 
@@ -2245,9 +2210,7 @@ void exitPause() {
     lastWaterSensorOK += pausedDuration;
   }
 
-  if (lastAirSensorOK != 0) {
-    lastAirSensorOK += pausedDuration;
-  }
+  // ESP-NOW packet age is wall-clock based; never extend on pause.
 
   // ----------------------------------------------------------
   // คืนสถานะอุปกรณ์ทุกตัวกลับไปเหมือนก่อน pause เป๊ะๆ
@@ -2262,6 +2225,7 @@ void exitPause() {
   digitalWrite(MOTOR, pausedState_Motor ? HIGH : LOW);
   digitalWrite(FAN_DC, pausedState_FanDC ? HIGH : LOW);
   if (currentStage == 2 || currentStage == 3) {
+    serviceSensorESPNow();
     pausedState_MistMaker = false;
     pausedState_Heater = false;  // wait for a fresh SHT45 sample in stage loop
   }
@@ -2325,12 +2289,14 @@ bool handleProcessPause() {
     }
 
     ensureConnected();
+    serviceSensorESPNow();
 
     // PATCH: ให้ Blower cool-down ทำงานต่อระหว่าง Pause
     updateBlowerCooldown();
 
     recoverLCDIfNeeded();
 
+    serviceSensorESPNow();
     if (resumeFlagRequested) {
       resumeFlagRequested = false;
       exitPause();
@@ -2562,6 +2528,18 @@ void stage2_DrainAndHumidify() {
   // ดับไฟ Stage 1 และเปิดไฟสีเหลืองค้างตลอด Stage 2
   setStageLED(2);
 
+  // Stage 2 configuration:
+  // - PTC/Heater (GPIO18) must remain OFF for the whole stage.
+  // - Ventilation fan FAN_DC (GPIO26) runs for the whole stage.
+  // The heater blower may finish its existing Stage 1 cool-down, then stops
+  // normally; it is not turned back on by Stage 2.
+  stage2_heaterState = false;
+  digitalWrite(HEATER, LOW);
+  publishState(TOPIC_HEATER, false);
+
+  digitalWrite(FAN_DC, HIGH);
+  publishState(TOPIC_FAN, true);
+
   // แจ้งเตือนหนึ่งครั้งเมื่อเข้าสู่ Stage 2
   beep2();
 
@@ -2658,9 +2636,6 @@ void stage2_DrainAndHumidify() {
       // บันทึกเข้า log buffer (จะบันทึกจริงทุก 2 วิเท่านั้น)
       maybeAddToLogBuffers(NAN, temp, humid);
 
-      float smoothedTemp = getBufferAverage(airTempLog);
-      if (isnan(smoothedTemp)) smoothedTemp = temp;
-
       float smoothedHumid = getBufferAverage(humidLog);
       if (isnan(smoothedHumid)) smoothedHumid = humid;
 
@@ -2673,14 +2648,14 @@ void stage2_DrainAndHumidify() {
 
       publishState(TOPIC_MISTMAKER, stage2_mistState);
 
-      // Heater
+      // PTC is deliberately disabled in Stage 2. Reassert both outputs every
+      // control cycle so a resume or transient cannot turn the heater on.
+      stage2_heaterState = false;
+      digitalWrite(HEATER, LOW);
+      publishState(TOPIC_HEATER, false);
 
-      stage2_heaterState = hysteresisControl(smoothedTemp, STAGE2_TEMP_TARGET,
-                                             STAGE2_TEMP_HYSTERESIS, stage2_heaterState);
-
-      setHeaterAndBlower(stage2_heaterState);
-
-      publishState(TOPIC_HEATER, stage2_heaterState);
+      digitalWrite(FAN_DC, HIGH);
+      publishState(TOPIC_FAN, true);
     }
 
     publishAllSensors();
@@ -2694,9 +2669,13 @@ void stage2_DrainAndHumidify() {
 
   digitalWrite(MISTMAKER, LOW);
 
+  digitalWrite(FAN_DC, LOW);
+
   setHeaterAndBlower(false);
 
   publishState(TOPIC_MISTMAKER, false);
+
+  publishState(TOPIC_FAN, false);
 
   publishState(TOPIC_HEATER, false);
 
@@ -3019,13 +2998,6 @@ void setup() {
   // LCD ใช้ I2C bus หลัก (Wire)
   Wire.begin(LCD_I2C_SDA_PIN, LCD_I2C_SCL_PIN);
 
-  // SHT45 ใช้ I2C bus ที่สอง (Wire1)
-  Wire1.begin(SHT45_I2C_SDA_PIN, SHT45_I2C_SCL_PIN);
-
-  // SHT45 ใช้ I2C bus แยก จึงใช้ความเร็วปกติ 100 kHz
-  Wire1.setClock(100000);
-
-  Wire1.setTimeOut(50);
 
   // ป้องกัน I2C ค้างรอนานเมื่อ LCD หรือสายสัญญาณถูกรบกวน
   Wire.setTimeOut(50);
@@ -3120,30 +3092,7 @@ void setup() {
 
   Serial.println(ds18b20.getDeviceCount());
 
-  // ==========================================================
-  // SHT45
-  // ==========================================================
-
-  Serial.println("Checking SHT45...");
-
-  if (sht45.begin()) {
-    sht45Available = true;
-
-    Serial.println("SHT45 CONNECTED!");
-
-    lcdShow("SHT45", "Connected!");
-
-  } else {
-    sht45Available = false;
-
-    Serial.println("SHT45 NOT FOUND!");
-
-    Serial.println("Continue without SHT45...");
-
-    lcdShow("SHT45 ERROR", "Continue...");
-  }
-
-  delay(1000);
+  // ESP-NOW receiver starts after Wi-Fi initialization below.
 
   // ==========================================================
   // WIFI
@@ -3171,6 +3120,7 @@ void setup() {
   // ==========================================================
 
   connectAll();
+  setupESPNowReceiver();
 
   // ส่งสถานะเริ่มต้น OFF ของอุปกรณ์ทั้งหมดไปยัง Home Assistant
 
@@ -3235,6 +3185,7 @@ void setup() {
 // ============================================================
 
 void loop() {
+  serviceSensorESPNow();
   ensureConnected();
   recoverLCDIfNeeded();
 
@@ -3379,3 +3330,7 @@ void loop() {
   // ตรวจปุ่มได้รวดเร็ว โดยไม่ส่ง Sensor ถี่เกินไป
   delay(50);
 }
+
+
+
+
