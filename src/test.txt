@@ -1,0 +1,282 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <time.h>
+
+#define SDA_PIN 25
+#define SCL_PIN 26
+
+// ใช้ sensor 2 สำหรับนับคน
+#define sensorIN 22
+#define sensorOUT 23
+
+#define relay 4
+#define buzzer 5
+
+// ===== ห้องที่ 1 =====
+#define doorSensor 18
+#define ledRed 19
+#define ledGreen 21
+
+// ===== ห้องที่ 2 =====
+#define doorSensor2 32
+#define ledRed2 33
+#define ledGreen2 27
+
+#define WIFI_SSID "NATSAREE"
+#define WIFI_PASSWORD "0853292585" 883767239
+
+#define MQTT_SERVER "172.20.10.5"
+#define MQTT_PORT 1883
+#define MQTT_USER "WDwTfoZk2abkPAPzuVho"
+#define MQTT_PASSWORD ""
+
+#define MQTT_TOPIC "CoE/toilet/people"
+#define MQTT_CONTROL "CoE/toilet/light"
+#define MQTT_STATUS "CoE/toilet/status"
+
+#define MQTT_ROOM1 "CoE/toilet/room1"
+#define MQTT_ROOM2 "CoE/toilet/room2"
+
+#define MQTT_LCD "CoE/toilet/lcd"
+#define MQTT_TIME "CoE/toilet/time"
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+int counter = 0;
+bool manualLight = false;
+
+// ===== สถานะห้อง =====
+bool room1Occupied = false;
+bool room2Occupied = false;
+
+// ===== state machine =====
+int state = 0;
+unsigned long lastTriggerTime = 0;
+
+unsigned long lastStatusSend = 0;
+
+/* ---------- MQTT RECEIVE ---------- */
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) message += (char)payload[i];
+  message.trim();
+
+  if (String(topic) == MQTT_CONTROL) {
+    if (message == "ON") manualLight = true;
+    else if (message == "OFF") manualLight = false;
+  }
+}
+
+/* ---------- WIFI ---------- */
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+}
+
+/* ---------- MQTT ---------- */
+void connectMQTT() {
+  while (!client.connected()) {
+    String clientId = "ESP32_toilet_" + String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
+      client.subscribe(MQTT_CONTROL);
+    } else delay(3000);
+  }
+}
+
+/* ---------- SENSOR ห้อง ---------- */
+void readSensors() {
+  room1Occupied = (digitalRead(doorSensor) == LOW);
+  room2Occupied = (digitalRead(doorSensor2) == HIGH);
+}
+
+/* ---------- ห้องว่าง ---------- */
+int getFreeRoom() {
+  int freeRoom = 0;
+
+  if (!room1Occupied) freeRoom++;
+  if (!room2Occupied) freeRoom++;
+
+  return freeRoom;
+}
+
+/* ---------- LCD ---------- */
+void updateLCD() {
+  String line1 = "People: " + String(counter);
+  String line2 = "Free Room: " + String(getFreeRoom());
+
+  // ===== แสดงบน LCD =====
+  lcd.setCursor(0,0);
+  lcd.print(line1 + "   ");
+
+  lcd.setCursor(0,1);
+  lcd.print(line2 + "   ");
+
+  // ===== ส่งไป Home Assistant =====
+  String payload = line1 + " | " + line2;
+  client.publish(MQTT_LCD, payload.c_str());
+}
+
+/* ---------- MQTT ---------- */
+void sendMQTT() {
+  String payload = "จำนวนคนในห้องน้ำ : " + String(counter);
+  client.publish(MQTT_TOPIC, payload.c_str());
+}
+
+void sendStatus() {
+  int freeRoom = getFreeRoom();
+  String payload = (freeRoom == 0) ? "เต็ม" : "ว่าง " + String(freeRoom) + " ห้อง";
+  client.publish(MQTT_STATUS, payload.c_str());
+}
+
+/* ---------- BUZZER (Passive) ---------- */
+void beep() {
+  tone(buzzer, 3000);
+  delay(100);
+  tone(buzzer, 4000);
+  delay(150);
+  noTone(buzzer);
+}
+void sendRoomStatus() {
+  client.publish(MQTT_ROOM1, room1Occupied ? "กำลังใช้งาน" : "ว่างอยู่");
+  client.publish(MQTT_ROOM2, room2Occupied ? "กำลังใช้งาน" : "ว่างอยู่");
+}
+void sendTime() {
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+
+  char buffer[20];
+  strftime(buffer, sizeof(buffer), "%d-%m-%Y %H:%M:%S", &timeinfo);
+
+  client.publish(MQTT_TIME, buffer);
+}
+
+/* ---------- SETUP ---------- */
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  pinMode(sensorIN, INPUT_PULLUP);
+  pinMode(sensorOUT, INPUT_PULLUP);
+
+  pinMode(relay, OUTPUT);
+  pinMode(buzzer, OUTPUT);
+
+  pinMode(doorSensor, INPUT_PULLUP);
+  pinMode(doorSensor2, INPUT_PULLUP);
+
+  pinMode(ledRed, OUTPUT);
+  pinMode(ledGreen, OUTPUT);
+  pinMode(ledRed2, OUTPUT);
+  pinMode(ledGreen2, OUTPUT);
+
+  noTone(buzzer);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.print("People Counter");
+  delay(2000);
+  lcd.clear();
+
+  connectWiFi();
+
+  configTime(7 * 3600, 0, "pool.ntp.org");
+
+  client.setServer(MQTT_SERVER, MQTT_PORT);
+  client.setCallback(callback);
+
+  updateLCD();
+}
+
+/* ---------- LOOP ---------- */
+void loop() {
+
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (!client.connected()) connectMQTT();
+
+  client.loop();
+
+  readSensors();
+
+  // ===== อ่าน sensor นับคน =====
+  bool inSensor = (digitalRead(sensorIN) == LOW);
+  bool outSensor = (digitalRead(sensorOUT) == LOW);
+
+  // ===== STATE MACHINE =====
+  switch(state) {
+
+    case 0:
+      if (inSensor) {
+        state = 1;
+        lastTriggerTime = millis();
+      }
+      else if (outSensor) {
+        state = 2;
+        lastTriggerTime = millis();
+      }
+      break;
+
+    case 1:
+      if (outSensor) {
+        counter++;
+        updateLCD();
+        sendMQTT();
+        beep();
+        state = 0;
+      }
+      break;
+
+    case 2:
+      if (inSensor) {
+        if (counter > 0) counter--;
+        updateLCD();
+        sendMQTT();
+        beep();
+        state = 0;
+      }
+      break;
+  }
+
+  // กันค้าง
+  if (millis() - lastTriggerTime > 2000) {
+    state = 0;
+  }
+/* ---------- LED ห้อง 1 ---------- */
+  if (room1Occupied) {
+    digitalWrite(ledRed, HIGH);
+    digitalWrite(ledGreen, LOW);
+  } else {
+    digitalWrite(ledGreen, HIGH);
+    digitalWrite(ledRed, LOW);
+  }
+
+  /* ---------- LED ห้อง 2 ---------- */
+  if (room2Occupied) {
+    digitalWrite(ledRed2, HIGH);
+    digitalWrite(ledGreen2, LOW);
+  } else {
+    digitalWrite(ledGreen2, HIGH);
+    digitalWrite(ledRed2, LOW);
+  }
+
+  updateLCD();
+  // ===== MQTT =====
+  if (millis() - lastStatusSend > 1000) {
+    sendStatus();
+    sendRoomStatus();
+    sendTime();
+    lastStatusSend = millis();
+  }
+
+  // ===== LIGHT =====
+  digitalWrite(relay, (counter > 0 || manualLight));
+
+}

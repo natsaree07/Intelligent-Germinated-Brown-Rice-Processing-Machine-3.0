@@ -1,0 +1,600 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ArtronShop_SHT45.h>
+#include <LiquidCrystal_I2C.h>
+
+// ==========================
+// !!! กรอกข้อมูลของคุณตรงนี้ !!!
+// ==========================
+#define WIFI_SSID       "121HOME_2.4G"
+#define WIFI_PASSWORD   "883767239"
+
+#define MQTT_SERVER     "192.168.1.47"
+#define MQTT_PORT       1883
+#define MQTT_USER       "WDwTfoZk2abkPAPzuVho"
+#define MQTT_PASSWORD   "
+
+// ==========================
+// MQTT Topics
+// ==========================
+const char* TOPIC_STATUS      = "ricedryer/status";
+const char* TOPIC_STAGE       = "ricedryer/stage";
+const char* TOPIC_WATER_TEMP  = "ricedryer/water_temp";
+const char* TOPIC_TEMP        = "ricedryer/temperature";
+const char* TOPIC_HUMIDITY    = "ricedryer/humidity";
+const char* TOPIC_HEATER      = "ricedryer/heater";
+const char* TOPIC_MISTMAKER   = "ricedryer/mistmaker";
+
+// ==========================
+// LCD
+// ==========================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ==========================
+// อุปกรณ์ (Relay/SSR)
+// ==========================
+#define SOLENOID_IN    27   // วาล์วเติมน้ำเข้า
+#define SOLENOID_DRAIN 25   // วาล์วปล่อยน้ำออก
+#define HEATER         18   // SSR ควบคุม PTC ฮีตเตอร์
+#define MISTMAKER      33   // สร้างละอองไอน้ำ
+#define BUZZER         4
+
+// ==========================
+// เซนเซอร์
+// ==========================
+#define ONE_WIRE_BUS   15   // DS18B20 (วัดอุณหภูมิน้ำ)
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
+ArtronShop_SHT45 sht45(&Wire, 0x44);
+
+// ==========================
+// WiFi / MQTT Client
+// ==========================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// ==========================
+// ตัวแปรสำหรับ Retry แบบไม่บล็อก
+// ==========================
+unsigned long lastReconnectAttempt = 0;
+const unsigned long RECONNECT_INTERVAL = 5000; // ลองใหม่ทุก 5 วินาที
+
+// ==========================
+// พารามิเตอร์ควบคุม (ปรับได้ตามต้องการ)
+// ==========================
+const float WATER_TEMP_TARGET   = 30.0;   // °C สำหรับสเตจ 1
+const float STAGE2_TEMP_TARGET  = 30.0;   // °C สำหรับสเตจ 2
+const float STAGE2_HUMID_TARGET = 80.0;   // %RH สำหรับสเตจ 2
+const float STAGE3_TEMP_TARGET  = 50.0;   // °C สำหรับสเตจ 3 (อบแห้ง)
+const float STAGE3_HUMID_TARGET = 14.0;   // %RH เป้าหมายความชื้นสุดท้าย
+
+const unsigned long STAGE1_DURATION = 10UL * 60UL * 1000UL; // 10 นาที (ปรับได้)
+const unsigned long STAGE2_DURATION = 10UL * 60UL * 1000UL; // 10 นาที (ปรับได้)
+const unsigned long FILL_WATER_TIME  = 15000; // เวลาเปิดวาล์วเติมน้ำ (ms)
+const unsigned long DRAIN_WATER_TIME = 10000; // เวลาเปิดวาล์วปล่อยน้ำ (ms)
+
+// ==================================================
+// Buzzer
+// ==================================================
+void beep2() {
+  for (int i = 0; i < 2; i++) {
+    tone(BUZZER, 2000);
+    delay(200);
+    noTone(BUZZER);
+    delay(100);
+  }
+}
+
+void beepDone() {
+  for (int i = 0; i < 4; i++) {
+    tone(BUZZER, 2500);
+    delay(150);
+    noTone(BUZZER);
+    delay(150);
+  }
+}
+
+// ==================================================
+// LCD helper
+// ==================================================
+void lcdShow(String line1, String line2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
+
+// ==================================================
+// เชื่อมต่อ WiFi ตอนเริ่มเครื่อง (มีลิมิตเวลา ไม่ค้างตลอดไป)
+// ==================================================
+void connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int attempt = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempt < 30) {
+    lcdShow("Connecting WiFi", "Attempt " + String(attempt));
+    Serial.println("Connecting to WiFi...");
+    delay(1000);
+    attempt++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("WiFi not available - will keep working, retry in background");
+    lcdShow("WiFi Failed", "Working Offline");
+    delay(1500);
+  }
+}
+
+// ==================================================
+// เชื่อมต่อ MQTT ตอนเริ่มเครื่อง (มีลิมิตเวลา ไม่ค้างตลอดไป)
+// ==================================================
+
+void connectMQTT() {
+
+  mqttClient.setServer(
+    MQTT_SERVER,
+    MQTT_PORT
+  );
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println(
+      "MQTT skipped - WiFi not connected"
+    );
+
+    return;
+  }
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("Connecting to MQTT...");
+
+  Serial.print("MQTT Server: ");
+  Serial.println(MQTT_SERVER);
+
+  Serial.print("MQTT Port: ");
+  Serial.println(MQTT_PORT);
+
+  Serial.println("================================");
+
+  int attempt = 0;
+
+  while (
+    !mqttClient.connected() &&
+    attempt < 10
+  ) {
+
+    // สร้าง Client ID ใหม่ทุกครั้ง
+    String clientId =
+        createMQTTClientID();
+
+    Serial.print("MQTT attempt ");
+    Serial.println(attempt + 1);
+
+    Serial.print("Client ID: ");
+    Serial.println(clientId);
+
+    lcdShow(
+      "Connecting MQTT",
+      "Attempt " + String(attempt + 1)
+    );
+
+    if (
+      mqttClient.connect(
+        clientId.c_str(),
+        MQTT_USER,
+        MQTT_PASSWORD
+      )
+    ) {
+
+      Serial.println("MQTT CONNECTED!");
+
+      mqttClient.publish(
+        TOPIC_STATUS,
+        "connected"
+      );
+
+      lcdShow(
+        "MQTT Connected",
+        "Ready"
+      );
+
+      delay(1000);
+
+      break;
+
+    } else {
+
+      Serial.print(
+        "MQTT failed, rc="
+      );
+
+      Serial.println(
+        mqttClient.state()
+      );
+
+      delay(3000);
+
+      attempt++;
+    }
+  }
+
+  if (!mqttClient.connected()) {
+
+    Serial.println("================================");
+    Serial.println("MQTT CONNECTION FAILED!");
+    Serial.println("Working in Offline Mode");
+    Serial.println("================================");
+
+    lcdShow(
+      "MQTT Failed",
+      "Offline Mode"
+    );
+
+    delay(1000);
+  }
+}
+
+void connectAll() {
+  connectWiFi();
+  connectMQTT();
+
+  if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
+    lcdShow("Connected!", "WiFi + MQTT OK");
+    beep2();
+  } else {
+    lcdShow("Offline Mode", "Process Continue");
+    beep2();
+  }
+  delay(1000);
+}
+
+// ==================================================
+// เช็คการเชื่อมต่อ แบบไม่บล็อก (ลองแป๊บเดียวแล้วไปทำงานต่อ)
+// เรียกใช้ระหว่างกระบวนการทำงานได้อย่างปลอดภัย
+// ==================================================
+void ensureConnected() {
+  unsigned long now = millis();
+
+  // ถ้า WiFi หลุด ลองเชื่อมใหม่ (ไม่บล็อก)
+  if (WiFi.status() != WL_CONNECTED) {
+    if (now - lastReconnectAttempt > RECONNECT_INTERVAL) {
+      lastReconnectAttempt = now;
+      Serial.println("Retrying WiFi (background)...");
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+    return;   // ไม่ค้างรอ ออกไปทำงานอื่นต่อทันที
+  }
+
+  // ถ้า WiFi ติดแล้ว แต่ MQTT ยังไม่ติด ลองเชื่อมใหม่ (ไม่บล็อก)
+  if (!mqttClient.connected()) {
+    if (now - lastReconnectAttempt > RECONNECT_INTERVAL) {
+      lastReconnectAttempt = now;
+      Serial.println("Retrying MQTT (background)...");
+      mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD);
+    }
+    return;
+  }
+
+  mqttClient.loop();
+}
+
+// ==================================================
+// อ่านเซนเซอร์
+// ==================================================
+float readWaterTemp() {
+  ds18b20.requestTemperatures();
+  return ds18b20.getTempCByIndex(0);
+}
+
+void readAmbient(float &temp, float &humid) {
+  temp = 0;
+  humid = 0;
+  if (sht45.measure()) {
+    temp = sht45.temperature();
+    humid = sht45.humidity();
+  }
+}
+
+// ==================================================
+// ส่งข้อมูลไปยัง Home Assistant (MQTT publish)
+// ทำงานได้แม้ HA ไม่พร้อม (แค่ข้ามการ publish ไป)
+// ==================================================
+void publishAllSensors() {
+  ensureConnected();
+
+  float waterTemp = readWaterTemp();
+  float temp, humid;
+  readAmbient(temp, humid);
+
+  Serial.print("Water:"); Serial.print(waterTemp);
+  Serial.print(" Temp:"); Serial.print(temp);
+  Serial.print(" Humid:"); Serial.println(humid);
+
+  if (mqttClient.connected()) {
+    char buf[16];
+
+    dtostrf(waterTemp, 4, 1, buf);
+    mqttClient.publish(TOPIC_WATER_TEMP, buf);
+
+    dtostrf(temp, 4, 1, buf);
+    mqttClient.publish(TOPIC_TEMP, buf);
+
+    dtostrf(humid, 4, 1, buf);
+    mqttClient.publish(TOPIC_HUMIDITY, buf);
+  } else {
+    Serial.println("(HA not reachable - skip publish)");
+  }
+}
+
+void publishStage(String stage) {
+  ensureConnected();
+  if (mqttClient.connected()) {
+    mqttClient.publish(TOPIC_STAGE, stage.c_str());
+  }
+}
+
+void publishDeviceState(const char* topic, bool state) {
+  ensureConnected();
+  if (mqttClient.connected()) {
+    mqttClient.publish(topic, state ? "ON" : "OFF");
+  }
+}
+
+// ==================================================
+// STAGE 1: เติมน้ำ + ควบคุมอุณหภูมิน้ำ
+// ==================================================
+void stage1_FillAndHeatWater() {
+
+  Serial.println("=== STAGE 1: FILL & HEAT WATER ===");
+  publishStage("stage1_fill_heat");
+  lcdShow("STAGE 1", "Filling Water");
+
+  // ----- เติมน้ำเข้าเครื่องตามที่กำหนดไว้ (จับเวลาอย่างเดียว) -----
+  digitalWrite(SOLENOID_IN, HIGH);
+  delay(FILL_WATER_TIME);
+  digitalWrite(SOLENOID_IN, LOW);
+  Serial.println("Water filling done (timed)");
+
+  // ----- ควบคุมอุณหภูมิน้ำ จนครบเวลาที่กำหนด -----
+  unsigned long stageStart = millis();
+
+  while (millis() - stageStart < STAGE1_DURATION) {
+
+    ensureConnected();
+
+    float waterTemp = readWaterTemp();
+    Serial.print("Water Temp: "); Serial.println(waterTemp);
+
+    lcdShow("Water:" + String(waterTemp,1) + "C",
+            "Target:" + String(WATER_TEMP_TARGET,0) + "C");
+
+    if (waterTemp < WATER_TEMP_TARGET) {
+      digitalWrite(HEATER, HIGH);
+      publishDeviceState(TOPIC_HEATER, true);
+    } else {
+      digitalWrite(HEATER, LOW);
+      publishDeviceState(TOPIC_HEATER, false);
+    }
+
+    publishAllSensors();
+    delay(2000);
+  }
+
+  digitalWrite(HEATER, LOW);
+  publishDeviceState(TOPIC_HEATER, false);
+
+  Serial.println("STAGE 1 COMPLETE");
+  publishStage("stage1_complete");
+  lcdShow("Stage 1 Done", "Water Heated");
+  beep2();
+  delay(1000);
+}
+
+// ==================================================
+// STAGE 2: ปล่อยน้ำออก + ควบคุมอุณหภูมิ/ความชื้น (Mist)
+// ==================================================
+void stage2_DrainAndHumidify() {
+
+  Serial.println("=== STAGE 2: DRAIN & HUMIDIFY ===");
+  publishStage("stage2_drain_humidify");
+  lcdShow("STAGE 2", "Draining Water");
+
+  // ----- ปล่อยน้ำออก (จับเวลาอย่างเดียว) -----
+  digitalWrite(SOLENOID_DRAIN, HIGH);
+  delay(DRAIN_WATER_TIME);
+  digitalWrite(SOLENOID_DRAIN, LOW);
+
+  // ----- ควบคุมอุณหภูมิและความชื้น จนครบเวลาที่กำหนด -----
+  unsigned long stageStart = millis();
+
+  while (millis() - stageStart < STAGE2_DURATION) {
+
+    ensureConnected();
+
+    float temp, humid;
+    readAmbient(temp, humid);
+
+    Serial.print("Temp: "); Serial.print(temp);
+    Serial.print("  Humidity: "); Serial.println(humid);
+
+    lcdShow("T:" + String(temp,1) + " H:" + String(humid,0) + "%",
+            "Stage2 Running");
+
+    if (humid < STAGE2_HUMID_TARGET) {
+      digitalWrite(MISTMAKER, HIGH);
+      publishDeviceState(TOPIC_MISTMAKER, true);
+    } else {
+      digitalWrite(MISTMAKER, LOW);
+      publishDeviceState(TOPIC_MISTMAKER, false);
+    }
+
+    if (temp < STAGE2_TEMP_TARGET) {
+      digitalWrite(HEATER, HIGH);
+      publishDeviceState(TOPIC_HEATER, true);
+    } else {
+      digitalWrite(HEATER, LOW);
+      publishDeviceState(TOPIC_HEATER, false);
+    }
+
+    publishAllSensors();
+    delay(2000);
+  }
+
+  digitalWrite(MISTMAKER, LOW);
+  digitalWrite(HEATER, LOW);
+  publishDeviceState(TOPIC_MISTMAKER, false);
+  publishDeviceState(TOPIC_HEATER, false);
+
+  Serial.println("STAGE 2 COMPLETE");
+  publishStage("stage2_complete");
+  lcdShow("Stage 2 Done", "Humidify OK");
+  beep2();
+  delay(1000);
+}
+
+// ==================================================
+// STAGE 3: อบแห้ง (ควบคุมอุณหภูมิ+ความชื้นจนถึงเป้าหมาย)
+// ==================================================
+void stage3_Drying() {
+
+  Serial.println("=== STAGE 3: DRYING ===");
+  publishStage("stage3_drying");
+  lcdShow("STAGE 3", "Drying...");
+
+  bool done = false;
+
+  while (!done) {
+
+    ensureConnected();
+
+    float temp, humid;
+    readAmbient(temp, humid);
+
+    Serial.print("Temp: "); Serial.print(temp);
+    Serial.print("  Humidity: "); Serial.println(humid);
+
+    lcdShow("T:" + String(temp,1) + " H:" + String(humid,0) + "%",
+            "Drying Stage");
+
+    if (temp < STAGE3_TEMP_TARGET) {
+      digitalWrite(HEATER, HIGH);
+      publishDeviceState(TOPIC_HEATER, true);
+      publishAllSensors();
+      delay(2000);
+      continue;
+    }
+
+    if (humid > STAGE3_HUMID_TARGET) {
+      digitalWrite(HEATER, HIGH);
+      publishDeviceState(TOPIC_HEATER, true);
+      publishAllSensors();
+      delay(2000);
+      continue;
+    }
+
+    done = true;
+  }
+
+  digitalWrite(HEATER, LOW);
+  publishDeviceState(TOPIC_HEATER, false);
+
+  Serial.println("STAGE 3 COMPLETE - DRYING DONE");
+  publishStage("stage3_complete");
+  lcdShow("Drying Done!", "Rice is Ready");
+
+  beepDone();
+}
+
+// ==================================================
+// SETUP
+// ==================================================
+void setup() {
+
+  Serial.begin(115200);
+
+  // I2C
+  Wire.begin(21, 22);
+
+  // LCD
+  lcd.init();
+  lcd.backlight();
+  lcdShow("System Start", "Loading...");
+  delay(1500);
+
+  // Output pins
+  pinMode(SOLENOID_IN, OUTPUT);
+  pinMode(SOLENOID_DRAIN, OUTPUT);
+  pinMode(HEATER, OUTPUT);
+  pinMode(MISTMAKER, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  digitalWrite(SOLENOID_IN, LOW);
+  digitalWrite(SOLENOID_DRAIN, LOW);
+  digitalWrite(HEATER, LOW);
+  digitalWrite(MISTMAKER, LOW);
+  noTone(BUZZER);
+
+  // DS18B20
+  ds18b20.begin();
+
+  // SHT45
+  while (!sht45.begin()) {
+    Serial.println("SHT45 not found!");
+    lcdShow("SHT45 ERROR", "Check Sensor");
+    delay(1000);
+  }
+
+  // ==========================
+  // WiFi Auto-Reconnect
+  // ==========================
+  WiFi.persistent(true);
+  WiFi.setAutoReconnect(true);
+
+  // ==========================
+  // เชื่อมต่อ WiFi, MQTT, Home Assistant
+  // (มีลิมิตเวลา ไม่ค้างตลอดไปถ้าเชื่อมไม่ได้)
+  // ==========================
+  connectAll();
+
+  // ==========================
+  // อ่านค่าจากเซนเซอร์ทั้งหมด + ส่งไปยัง Home Assistant
+  // ==========================
+  lcdShow("Reading Sensors", "Please wait...");
+  publishAllSensors();
+  delay(1000);
+
+  // ==========================
+  // เริ่มระบบให้ทำงานตามลำดับ
+  // (ทำงานต่อได้แม้ WiFi/MQTT ไม่พร้อม)
+  // ==========================
+  lcdShow("Starting", "Process...");
+  beep2();
+  delay(1000);
+
+  stage1_FillAndHeatWater();
+  stage2_DrainAndHumidify();
+  stage3_Drying();
+
+  Serial.println("=== ALL PROCESS COMPLETE ===");
+  publishStage("all_complete");
+  lcdShow("Process Done!", "System Idle");
+}
+
+// ==================================================
+// LOOP
+// ==================================================
+void loop() {
+  // กระบวนการทำงานจบแล้วใน setup()
+  // loop() แค่รักษาการเชื่อมต่อ MQTT ไว้ (แบบไม่บล็อก)
+  ensureConnected();
+  delay(1000);
+}
